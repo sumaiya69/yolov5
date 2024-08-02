@@ -27,7 +27,7 @@ Usage - formats:
                                  yolov5s_edgetpu.tflite     # TensorFlow Edge TPU
                                  yolov5s_paddle_model       # PaddlePaddle
 """
-
+import time
 import argparse
 import csv
 import os
@@ -36,6 +36,8 @@ import sys
 from pathlib import Path
 
 import torch
+import threading
+import GPUtil
 
 FILE = Path(__file__).resolve()
 ROOT = FILE.parents[0]  # YOLOv5 root directory
@@ -177,6 +179,28 @@ def run(
     else:
         dataset = LoadImages(source, img_size=imgsz, stride=stride, auto=pt, vid_stride=vid_stride)
     vid_path, vid_writer = [None] * bs, [None] * bs
+    
+    
+    
+    ##############
+    
+    
+    #GPU memory usage monitoring
+    # GPU memory usage monitoring
+    def monitor_gpu_usage():
+        while not inference_done:
+            gpu_memory_usage = GPUtil.getGPUs()[0].memoryUsed  # in MB
+            gpu_memory_usage_list.append(gpu_memory_usage)
+            time.sleep(0.1)
+
+    gpu_memory_usage_list = []
+    inference_done = False
+    monitor_thread = threading.Thread(target=monitor_gpu_usage)
+    monitor_thread.start()
+    
+    
+    ###############
+    
 
     # Run inference
     model.warmup(imgsz=(1 if pt or model.triton else bs, 3, *imgsz))  # warmup
@@ -304,9 +328,21 @@ def run(
         # Print time (inference-only)
         LOGGER.info(f"{s}{'' if len(det) else '(no detections), '}{dt[1].dt * 1E3:.1f}ms")
 
+    inference_done = True
+    monitor_thread.join()
+
+
+
     # Print results
     t = tuple(x.t / seen * 1e3 for x in dt)  # speeds per image
     LOGGER.info(f"Speed: %.1fms pre-process, %.1fms inference, %.1fms NMS per image at shape {(1, 3, *imgsz)}" % t)
+    average_inference_time_ms = t[1]
+    average_inference_time_s = average_inference_time_ms / 1000
+    throughput = 1 / average_inference_time_s
+    LOGGER.info(f"Inference throughput: {throughput:.2f} images per second")
+    max_gpu_memory_usage = max(gpu_memory_usage_list)
+    LOGGER.info(f"Max GPU memory usage: {max_gpu_memory_usage:.2f} MB")
+    
     if save_txt or save_img:
         s = f"\n{len(list(save_dir.glob('labels/*.txt')))} labels saved to {save_dir / 'labels'}" if save_txt else ""
         LOGGER.info(f"Results saved to {colorstr('bold', save_dir)}{s}")

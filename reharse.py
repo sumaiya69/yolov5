@@ -1,28 +1,54 @@
+# YOLOv5 🚀 by Ultralytics, AGPL-3.0 license
+"""
+Run YOLOv5 detection inference on images, videos, directories, globs, YouTube, webcam, streams, etc.
+
+Usage - sources:
+    $ python detect.py --weights yolov5s.pt --source 0                               # webcam
+                                                     img.jpg                         # image
+                                                     vid.mp4                         # video
+                                                     screen                          # screenshot
+                                                     path/                           # directory
+                                                     list.txt                        # list of images
+                                                     list.streams                    # list of streams
+                                                     'path/*.jpg'                    # glob
+                                                     'https://youtu.be/Zgi9g1ksQHc'  # YouTube
+                                                     'rtsp://example.com/media.mp4'  # RTSP, RTMP, HTTP stream
+
+Usage - formats:
+    $ python detect.py --weights yolov5s.pt                 # PyTorch
+                                 yolov5s.torchscript        # TorchScript
+                                 yolov5s.onnx               # ONNX Runtime or OpenCV DNN with --dnn
+                                 yolov5s_openvino_model     # OpenVINO
+                                 yolov5s.engine             # TensorRT
+                                 yolov5s.mlmodel            # CoreML (macOS-only)
+                                 yolov5s_saved_model        # TensorFlow SavedModel
+                                 yolov5s.pb                 # TensorFlow GraphDef
+                                 yolov5s.tflite             # TensorFlow Lite
+                                 yolov5s_edgetpu.tflite     # TensorFlow Edge TPU
+                                 yolov5s_paddle_model       # PaddlePaddle
+"""
+
 import argparse
 import os
 import platform
 import sys
 from pathlib import Path
-import time
+
 import torch
-import torch.nn as nn
+
 FILE = Path(__file__).resolve()
-ROOT = FILE.parents[0]
+ROOT = FILE.parents[0]  # YOLOv5 root directory
 if str(ROOT) not in sys.path:
-    sys.path.append(str(ROOT))
-ROOT = Path(os.path.relpath(ROOT, Path.cwd()))
+    sys.path.append(str(ROOT))  # add ROOT to PATH
+ROOT = Path(os.path.relpath(ROOT, Path.cwd()))  # relative
 
 from ultralytics.utils.plotting import Annotator, colors, save_one_box
+
 from models.common import DetectMultiBackend
 from utils.dataloaders import IMG_FORMATS, VID_FORMATS, LoadImages, LoadScreenshots, LoadStreams
 from utils.general import (LOGGER, Profile, check_file, check_img_size, check_imshow, check_requirements, colorstr, cv2,
                            increment_path, non_max_suppression, print_args, scale_boxes, strip_optimizer, xyxy2xywh)
 from utils.torch_utils import select_device, smart_inference_mode
-import GPUtil
-import threading
-import GPUtil
-
-
 
 
 def run(
@@ -54,9 +80,8 @@ def run(
         dnn=False,  # use OpenCV DNN for ONNX inference
         vid_stride=1,  # video frame-rate stride
 ):
-    
     source = str(source)
-    save_img = not nosave and not source.endswith('.txt')
+    save_img = not nosave and not source.endswith('.txt')  # save inference images
     is_file = Path(source).suffix[1:] in (IMG_FORMATS + VID_FORMATS)
     is_url = source.lower().startswith(('rtsp://', 'rtmp://', 'http://', 'https://'))
     webcam = source.isnumeric() or source.endswith('.streams') or (is_url and not is_file)
@@ -71,83 +96,73 @@ def run(
     # Load model
     device = select_device(device)
     model = DetectMultiBackend(weights, device=device, dnn=dnn, data=data, fp16=half)
-    #print(model)
-    
+
     ####################################################################################
     # Pruning
     import torch_pruning as tp
     print(model.model)
-    for p in model.model.parameters():
+    for p in model.parameters():
         p.requires_grad_(True)
 
     example_inputs = torch.randn(1, 3, 640, 640).to(device)  # Adjusted input size to match YOLOv5 input size
-    
+    imp = tp.importance.MagnitudeImportance(p=2)  # Magnitude Importance
+
     ignored_layers = []
     from models.yolo import Detect
     for m in model.model.modules():
         if isinstance(m, Detect):
             ignored_layers.append(m)
-    print(ignored_layers, "ignored Layers")
-    
+    print(ignored_layers)
+
+    iterative_steps = 3
+    pruner = tp.pruner.MagnitudePruner(
+        model.model,
+        example_inputs,
+        importance=imp,
+        global_pruning=False,
+        iterative_steps=iterative_steps,
+        pruning_ratio=0.2,  
+        ignored_layers=ignored_layers,
+    )
+
     base_macs, base_nparams = tp.utils.count_ops_and_params(model.model, example_inputs)
+    for i in range(iterative_steps):
+        #soft-pruning
+        for group in pruner.step(interactive=True):
+            for dep, idxs in group:
+                target_layer = dep.target.module
+                pruning_fn = dep.handler
+                if pruning_fn in [tp.prune_conv_in_channels, tp.prune_linear_in_channels]:
+                    target_layer.weight.data[:, idxs] *= 0
+                elif pruning_fn in [tp.prune_conv_out_channels, tp.prune_linear_out_channels]:
+                    target_layer.weight.data[idxs] *= 0
+                    if target_layer.bias is not None:
+                        target_layer.bias.data[idxs] *= 0
+                elif pruning_fn in [tp.prune_batchnorm_out_channels]:
+                    target_layer.weight.data[idxs] *= 0
+                    target_layer.bias.data[idxs] *= 0
+                #group.prune(idxs=[0, 2, 6])  # <= disable-hard-pruning
 
-    DG = tp.DependencyGraph()
-    DG.build_dependency(model.model, example_inputs=example_inputs)
+        for name, param in model.model.named_parameters():
+            if "conv" in name and "weight" in name:
+                print(f"After pruning step {i+1}: {name} -> {param}")
     
-    #intitial-layer
-    for layer in model.model.model[:2]:
-        if isinstance(layer, nn.Sequential):
-            for sublayer in layer:
-                if hasattr(sublayer, 'conv'):
-                    pruning_idxs = list(range(sublayer.conv.out_channels // 2))  # prune 50% channels
-                    group = DG.get_pruning_group(sublayer.conv, tp.prune_conv_out_channels, idxs=pruning_idxs)
-                    if DG.check_pruning_group(group):
-                        group.prune()
 
-    #mid-layers
-    for i in [2, 4, 6, 8]:
-        layer = model.model.model[i]
-        for sublayer in [layer.cv1, layer.cv2, layer.cv3]:
-            if hasattr(sublayer, 'conv'):
-                pruning_idxs = list(range(sublayer.conv.out_channels // 2))  #50%
-                group = DG.get_pruning_group(sublayer.conv, tp.prune_conv_out_channels, idxs=pruning_idxs)
-                if DG.check_pruning_group(group):
-                    group.prune()
-
-    for i in [3, 5, 7]:
-        layer = model.model.model[i]
-        if hasattr(layer, 'conv'):
-            pruning_idxs = list(range(layer.conv.out_channels // 2)) 
-            group = DG.get_pruning_group(layer.conv, tp.prune_conv_out_channels, idxs=pruning_idxs)
-            if DG.check_pruning_group(group):
-                group.prune()
-
-    #detection-layer
-    for i in range(9, 25):
-        layer = model.model.model[i]
-        if hasattr(layer, 'conv'):
-            pruning_idxs = list(range(layer.conv.out_channels // 2))  
-            group = DG.get_pruning_group(layer.conv, tp.prune_conv_out_channels, idxs=pruning_idxs)
-            if DG.check_pruning_group(group):
-                group.prune()
-                
-    #print(group.details())
     pruned_macs, pruned_nparams = tp.utils.count_ops_and_params(model.model, example_inputs)
+    print(model.model)
     print("Before Pruning: MACs=%f G, #Params=%f G" % (base_macs / 1e9, base_nparams / 1e9))
     print("After Pruning: MACs=%f G, #Params=%f G" % (pruned_macs / 1e9, pruned_nparams / 1e9))
 
-    pruned_model_path = "group_pruned_model.pt"
+    pruned_model_path = "soft_pruned_model.pt"
     torch.save({
         'model': model.model,
         'state_dict': model.model.state_dict(),
     }, pruned_model_path)
     print(f"Pruned model saved to {pruned_model_path}")
+  
+    
 
-
-##############################
-
-
-
+    ####################################################################################
 
 
     stride, names, pt = model.stride, model.names, model.pt
@@ -164,66 +179,8 @@ def run(
     else:
         dataset = LoadImages(source, img_size=imgsz, stride=stride, auto=pt, vid_stride=vid_stride)
     vid_path, vid_writer = [None] * bs, [None] * bs
-    
-    
-    ##############
-    
-    
-    #GPU memory usage monitoring
-    # GPU memory usage monitoring
-    def monitor_gpu_usage():
-        while not inference_done:
-            gpu_memory_usage = GPUtil.getGPUs()[0].memoryUsed  # in MB
-            gpu_memory_usage_list.append(gpu_memory_usage)
-            time.sleep(0.1)
 
-    gpu_memory_usage_list = []
-    inference_done = False
-    monitor_thread = threading.Thread(target=monitor_gpu_usage)
-    monitor_thread.start()
-    
-    
-    ###############
-    
-
-
-
-    def profile_inference(model, dataset, n_iter=10):
-        times = []
-        for _ in range(n_iter):
-            for path, im, im0s, vid_cap, s in dataset:
-                im = torch.from_numpy(im).to(model.device)
-                im = im.half() if model.fp16 else im.float()
-                im /= 255
-                if len(im.shape) == 3:
-                    im = im[None]
-                start = time.time()
-                with torch.no_grad():
-                    model(im, augment=False, visualize=False)
-                end = time.time()
-                times.append(end - start)
-                break  # Only run one batch per iteration
-        return times
-
-    # Inference time before pruning
-    before_pruning_times = profile_inference(model, dataset)
-    avg_inference_time_ms = (sum(before_pruning_times) / len(before_pruning_times)) * 1000
-    #LOGGER.info(f"Before pruning: {avg_inference_time_ms:.4f} milliseconds per image")
-
-    # Dataset for post-pruning evaluation
-    if webcam:
-        dataset = LoadStreams(source, img_size=imgsz, stride=stride, auto=pt, vid_stride=vid_stride)
-    elif screenshot:
-        dataset = LoadScreenshots(source, img_size=imgsz, stride=stride, auto=pt)
-    else:
-        dataset = LoadImages(source, img_size=imgsz, stride=stride, auto=pt, vid_stride=vid_stride)
-
-    # Inference time after pruning
-    after_pruning_times = profile_inference(model, dataset)
-    avg_inference_time_ms = (sum(after_pruning_times) / len(after_pruning_times)) * 1000
-    #LOGGER.info(f"After pruning: {avg_inference_time_ms:.4f} milliseconds per image")
-
-    # Run inference after pruning
+    # Run inference
     model.warmup(imgsz=(1 if pt or model.triton else bs, 3, *imgsz))  # warmup
     seen, windows, dt = 0, [], (Profile(), Profile(), Profile())
     for path, im, im0s, vid_cap, s in dataset:
@@ -242,6 +199,9 @@ def run(
         # NMS
         with dt[2]:
             pred = non_max_suppression(pred, conf_thres, iou_thres, classes, agnostic_nms, max_det=max_det)
+
+        # Second-stage classifier (optional)
+        # pred = utils.general.apply_classifier(pred, classifier_model, im, im0s)
 
         # Process predictions
         for i, det in enumerate(pred):  # per image
@@ -314,19 +274,10 @@ def run(
 
         # Print time (inference-only)
         LOGGER.info(f"{s}{'' if len(det) else '(no detections), '}{dt[1].dt * 1E3:.1f}ms")
-        
-    inference_done = True
-    monitor_thread.join()
 
     # Print results
     t = tuple(x.t / seen * 1E3 for x in dt)  # speeds per image
     LOGGER.info(f'Speed: %.1fms pre-process, %.1fms inference, %.1fms NMS per image at shape {(1, 3, *imgsz)}' % t)
-    average_inference_time_ms = t[1]
-    average_inference_time_s = average_inference_time_ms / 1000
-    throughput = 1 / average_inference_time_s
-    LOGGER.info(f"Inference throughput: {throughput:.2f} images per second")
-    max_gpu_memory_usage = max(gpu_memory_usage_list)
-    LOGGER.info(f"Max GPU memory usage: {max_gpu_memory_usage:.2f} MB")
     if save_txt or save_img:
         s = f"\n{len(list(save_dir.glob('labels/*.txt')))} labels saved to {save_dir / 'labels'}" if save_txt else ''
         LOGGER.info(f"Results saved to {colorstr('bold', save_dir)}{s}")
@@ -341,7 +292,7 @@ def parse_opt():
     parser.add_argument('--data', type=str, default=ROOT / 'data/coco128.yaml', help='(optional) dataset.yaml path')
     parser.add_argument('--imgsz', '--img', '--img-size', nargs='+', type=int, default=[640], help='inference size h,w')
     parser.add_argument('--conf-thres', type=float, default=0.25, help='confidence threshold')
-    parser.add_argument('--iou-thres', type=float, default=0.45, help='NMS IOU threshold')
+    parser.add_argument('--iou-thres', type=float, default=0.45, help='NMS IoU threshold')
     parser.add_argument('--max-det', type=int, default=1000, help='maximum detections per image')
     parser.add_argument('--device', default='', help='cuda device, i.e. 0 or 0,1,2,3 or cpu')
     parser.add_argument('--view-img', action='store_true', help='show results')
@@ -368,9 +319,11 @@ def parse_opt():
     print_args(vars(opt))
     return opt
 
+
 def main(opt):
     check_requirements(ROOT / 'requirements.txt', exclude=('tensorboard', 'thop'))
     run(**vars(opt))
+
 
 if __name__ == '__main__':
     opt = parse_opt()
